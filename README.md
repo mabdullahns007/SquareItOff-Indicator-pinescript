@@ -1,0 +1,1 @@
+# SquareItOff-Indicator-pinescript
