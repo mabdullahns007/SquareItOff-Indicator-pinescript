@@ -1,0 +1,312 @@
+//@version=6
+// =============================================================================
+//  SQUARE IT OFF! — Overnight (OR) vs Intraday (TR) Decomposition
+//
+//  Replicates the measurement framework of:
+//      Preet Deep Singh (2015), "Square it Off!: An intraday short-and-buy
+//      strategy", IIM Ahmedabad / SSRN abstract 3920557.
+//
+//  Definitions used by the paper (all in natural logs, Rogalski 1984 style):
+//      OR_t  (Overnight Return)      = ln( open_t  / close_{t-1} )
+//      TR_t  (Trading-time Return)   = ln( close_t / open_t )
+//      SIF   (Sum of Intraday Falls) = SUM( open_t - close_t )
+//
+//  SIF is *exactly* the point-P&L of "sell at the open, buy back at the close".
+//  The paper's Table 2 reports SIF for the whole sample and for six overnight
+//  trend slices; this indicator reproduces that table live for any symbol.
+//
+//  Table 4 of the paper reports two correlations per year:
+//      OR2TR = corr( OR_t      , TR_t     )  preceding overnight -> intraday
+//      TR2OR = corr( TR_t      , OR_{t+1} )  intraday -> following overnight
+//  Both are computed here on a rolling window.
+//
+//  Notes
+//  -----
+//  * Works on any timeframe. Daily/Weekly/Monthly charts use the chart bars;
+//    intraday charts pull the daily series and accumulate once per completed
+//    day, so the curves never repaint.
+//  * All figures are gross of costs. The paper quotes ~0.015% one-way for
+//    discount intraday brokerage (see the companion strategy script).
+// =============================================================================
+
+indicator("Square it Off! — Overnight vs Intraday Decomposition", "Square it Off! (OR/TR)", overlay = false, precision = 2)
+
+// ------------------------------------------------------------------ inputs --
+string GS = "Trend slice (paper, Table 2)"
+sliceMode = input.string("All days", "Active slice", group = GS, tooltip = "The paper slices SIF by the sign of the overnight gap on the day of the trade and on the day before it.", options = ["All days", "SIF with an overnight increase", "SIF with an overnight Decrease", "SIF with 2 overnight increases", "SIF without 2 overnight increases", "SIF with 2 overnight decreases", "SIF without 2 overnight decreases"])
+minOrPct  = input.float(0.0, "Minimum |overnight gap| (%)", minval = 0.0, step = 0.05, group = GS, tooltip = "The paper deletes years where the gap between previous close and open is negligible (e.g. NYSE before 1997). Use this to ignore days with no real overnight session.")
+
+string GD = "Display"
+unitMode  = input.string("Index points", "Units", options = ["Index points", "Compounded %"], group = GD)
+showSel   = input.bool(true,  "SIF — active slice", group = GD)
+showAll   = input.bool(true,  "SIF — all days", group = GD)
+showBH    = input.bool(true,  "Buy & hold", group = GD)
+showOR    = input.bool(false, "Cumulative overnight (OR)", group = GD)
+showTR    = input.bool(false, "Cumulative intraday (TR)", group = GD)
+showTable = input.bool(true,  "Show Table 2 / Table 4 panel", group = GD)
+tblPos    = input.string("Top right", "Panel position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = GD)
+tblSize   = input.string("Small", "Panel text size", options = ["Tiny", "Small", "Normal", "Large"], group = GD)
+
+string GC = "Correlations (paper, Table 4)"
+corrLen   = input.int(252, "Rolling window (trading days)", minval = 20, maxval = 5000, group = GC)
+
+string GR = "Sample window"
+useRange   = input.bool(false, "Limit to a date range", group = GR)
+startDate  = input.time(timestamp("01 Jan 1995 00:00 +0000"), "From", group = GR)
+endDate    = input.time(timestamp("01 Jan 2100 00:00 +0000"), "To",   group = GR)
+
+// ------------------------------------------------------- daily data source --
+// On intraday charts we read the daily series and only accumulate when a daily
+// bar has *completed* (the [1] values below), which guarantees no repainting.
+[dO, dC, dPC, dT] = request.security(syminfo.tickerid, "D", [open, close, close[1], time], lookahead=barmerge.lookahead_off)
+
+bool onDaily  = timeframe.isdwm
+bool newDaily = ta.change(dT) != 0
+
+float o_  = onDaily ? open     : dO[1]
+float c_  = onDaily ? close    : dC[1]
+float pc_ = onDaily ? close[1] : dPC[1]
+int   t_  = onDaily ? time     : int(dT[1])
+
+bool inRange = not useRange or (t_ >= startDate and t_ <= endDate)
+bool process = (onDaily ? true : newDaily) and not na(o_) and not na(c_) and not na(pc_) and o_ > 0 and pc_ > 0 and inRange
+
+// ---------------------------------------------------------------- helpers ---
+// Pearson correlation over two equal-length float arrays (paper's Table 4).
+f_pearson(array<float> x, array<float> y) =>
+    int n = array.size(x)
+    float r = na
+    if n > 2 and array.size(y) == n
+        float sx = 0.0
+        float sy = 0.0
+        for i = 0 to n - 1
+            sx += array.get(x, i)
+            sy += array.get(y, i)
+        float mx = sx / n
+        float my = sy / n
+        float sxy = 0.0
+        float sxx = 0.0
+        float syy = 0.0
+        for i = 0 to n - 1
+            float dx = array.get(x, i) - mx
+            float dy = array.get(y, i) - my
+            sxy += dx * dy
+            sxx += dx * dx
+            syy += dy * dy
+        r := sxx > 0 and syy > 0 ? sxy / math.sqrt(sxx * syy) : na
+    r
+
+// Table-2 slice membership. up/dn refer to today's overnight gap, up1/dn1 to
+// the previous trading day's gap.
+f_slice(int idx, bool up, bool up1, bool dn, bool dn1) =>
+    switch idx
+        0 => true
+        1 => up
+        2 => dn
+        3 => up and up1
+        4 => not (up and up1)
+        5 => dn and dn1
+        6 => not (dn and dn1)
+        => false
+
+f_sliceIdx(string s) =>
+    switch s
+        "All days"                          => 0
+        "SIF with an overnight increase"    => 1
+        "SIF with an overnight Decrease"    => 2
+        "SIF with 2 overnight increases"    => 3
+        "SIF without 2 overnight increases" => 4
+        "SIF with 2 overnight decreases"    => 5
+        "SIF without 2 overnight decreases" => 6
+        => 0
+
+// ------------------------------------------------------------------ state ---
+var array<float> sifPts = array.new<float>(7, 0.0)   // Table 2, in index points
+var array<float> sifLog = array.new<float>(7, 0.0)   // same, in log return
+var array<int>   sifN   = array.new<int>(7, 0)       // day count per slice
+var array<int>   sifWin = array.new<int>(7, 0)       // days that actually fell
+
+var array<float> aOR     = array.new<float>()        // OR_t
+var array<float> aTR     = array.new<float>()        // TR_t          (same day)
+var array<float> aTRprev = array.new<float>()        // TR_{t-1}
+var array<float> aORcur  = array.new<float>()        // OR_t          (paired)
+
+var float prevOR   = na
+var float prevTR   = na
+var float bhBase   = na
+var float cumORpts = 0.0
+var float cumTRpts = 0.0
+var float cumORlog = 0.0
+var float cumTRlog = 0.0
+var int   nDays    = 0
+
+// Plot carriers (held flat between daily updates on intraday charts).
+var float plotSel = 0.0
+var float plotAll = 0.0
+var float plotBH  = 0.0
+var float plotOR  = 0.0
+var float plotTR  = 0.0
+
+var float lastOR   = na
+var float lastTR   = na
+var bool  lastPass = false
+
+int selIdx = f_sliceIdx(sliceMode)
+bool pctMode = unitMode == "Compounded %"
+
+// ------------------------------------------------------------------- core ---
+if process
+    float orLog = math.log(o_ / pc_)
+    float trLog = math.log(c_ / o_)
+    float orPts = o_ - pc_
+    float trPts = c_ - o_
+    float sifDay = -trPts                       // the intraday fall, open - close
+    float sifDayLog = -trLog                    // short P&L in log terms
+
+    bool gapOk = math.abs(orPts) / pc_ * 100.0 >= minOrPct
+    bool up  = orLog > 0 and gapOk
+    bool dn  = orLog < 0 and gapOk
+    bool up1 = nz(prevOR, 0.0) > 0
+    bool dn1 = nz(prevOR, 0.0) < 0
+
+    if na(bhBase)
+        bhBase := o_
+
+    nDays    += 1
+    cumORpts += orPts
+    cumTRpts += trPts
+    cumORlog += orLog
+    cumTRlog += trLog
+
+    for i = 0 to 6
+        if f_slice(i, up, up1, dn, dn1) and gapOk
+            array.set(sifPts, i, array.get(sifPts, i) + sifDay)
+            array.set(sifLog, i, array.get(sifLog, i) + sifDayLog)
+            array.set(sifN,   i, array.get(sifN,   i) + 1)
+            if sifDay > 0
+                array.set(sifWin, i, array.get(sifWin, i) + 1)
+
+    // rolling correlation buffers
+    array.push(aOR, orLog)
+    array.push(aTR, trLog)
+    if array.size(aOR) > corrLen
+        array.shift(aOR)
+        array.shift(aTR)
+    if not na(prevTR)
+        array.push(aTRprev, prevTR)
+        array.push(aORcur,  orLog)
+        if array.size(aTRprev) > corrLen
+            array.shift(aTRprev)
+            array.shift(aORcur)
+
+    prevOR := orLog
+    prevTR := trLog
+    lastOR := orLog
+    lastTR := trLog
+    lastPass := f_slice(selIdx, up, up1, dn, dn1) and gapOk
+
+    plotSel := pctMode ? (math.exp(array.get(sifLog, selIdx)) - 1.0) * 100.0 : array.get(sifPts, selIdx)
+    plotAll := pctMode ? (math.exp(array.get(sifLog, 0))      - 1.0) * 100.0 : array.get(sifPts, 0)
+    plotBH  := pctMode ? (c_ / bhBase - 1.0) * 100.0                          : c_ - bhBase
+    plotOR  := pctMode ? (math.exp(cumORlog) - 1.0) * 100.0                   : cumORpts
+    plotTR  := pctMode ? (math.exp(cumTRlog) - 1.0) * 100.0                   : cumTRpts
+
+// ------------------------------------------------------------------ plots ---
+plot(showSel ? plotSel : na, "SIF — active slice", color = color.new(#2962ff, 0),  linewidth = 2)
+plot(showAll ? plotAll : na, "SIF — all days",     color = color.new(#26a69a, 0),  linewidth = 1)
+plot(showBH  ? plotBH  : na, "Buy & hold",         color = color.new(#787b86, 0),  linewidth = 1)
+plot(showOR  ? plotOR  : na, "Cumulative OR",      color = color.new(#ff9800, 30), linewidth = 1)
+plot(showTR  ? plotTR  : na, "Cumulative TR",      color = color.new(#ef5350, 30), linewidth = 1)
+hline(0, "Zero", color = color.new(color.gray, 60), linestyle = hline.style_dotted)
+
+bgcolor(showSel and lastPass ? color.new(#2962ff, 92) : na, title = "Active-slice day")
+
+// ------------------------------------------------------------------ panel ---
+f_tblPos(string p) =>
+    switch p
+        "Top right"     => position.top_right
+        "Top left"      => position.top_left
+        "Bottom right"  => position.bottom_right
+        "Bottom left"   => position.bottom_left
+        => position.middle_right
+
+f_tblSize(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        => size.large
+
+var table panel = table.new(f_tblPos(tblPos), 5, 14, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 50), border_color = color.new(color.gray, 70))
+
+if showTable and barstate.islast
+    color hdrBg = color.new(#2962ff, 15)
+    color rowBg = color.new(color.gray, 92)
+    string unitTag = pctMode ? "%" : "pts"
+    string sizeT = f_tblSize(tblSize)
+
+    table.cell(panel, 0, 0, "Square it Off!  " + syminfo.ticker, text_color = color.white, bgcolor = hdrBg, text_size = sizeT, text_halign = text.align_left)
+    table.cell(panel, 1, 0, "SIF (" + unitTag + ")", text_color = color.white, bgcolor = hdrBg, text_size = sizeT)
+    table.cell(panel, 2, 0, "Days",        text_color = color.white, bgcolor = hdrBg, text_size = sizeT)
+    table.cell(panel, 3, 0, "Hit %",       text_color = color.white, bgcolor = hdrBg, text_size = sizeT)
+    table.cell(panel, 4, 0, "vs B&H",      text_color = color.white, bgcolor = hdrBg, text_size = sizeT)
+
+    array<string> names = array.from("SIF (all days)", "… with an overnight increase", "… with an overnight decrease", "… with 2 overnight increases", "… without 2 overnight increases", "… with 2 overnight decreases", "… without 2 overnight decreases")
+
+    float bh = na(bhBase) ? na : (pctMode ? (c_ / bhBase - 1.0) * 100.0 : c_ - bhBase)
+
+    for i = 0 to 6
+        float v = pctMode ? (math.exp(array.get(sifLog, i)) - 1.0) * 100.0 : array.get(sifPts, i)
+        int   n = array.get(sifN, i)
+        float hit = n > 0 ? array.get(sifWin, i) * 100.0 / n : na
+        float ratio = not na(bh) and bh != 0 ? v / math.abs(bh) * 100.0 : na
+        bool isActive = i == selIdx
+        color txt = v > 0 ? color.new(#26a69a, 0) : color.new(#ef5350, 0)
+        table.cell(panel, 0, i + 1, names.get(i), text_color = isActive ? color.white : chart.fg_color, bgcolor = isActive ? color.new(#2962ff, 60) : rowBg, text_size = sizeT, text_halign = text.align_left)
+        table.cell(panel, 1, i + 1, str.tostring(v, "#.##"), text_color = txt, bgcolor = rowBg, text_size = sizeT)
+        table.cell(panel, 2, i + 1, str.tostring(n), text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT)
+        table.cell(panel, 3, i + 1, na(hit) ? "—" : str.tostring(hit, "#.#") + "%", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT)
+        table.cell(panel, 4, i + 1, na(ratio) ? "—" : str.tostring(ratio, "#") + "%", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT)
+
+    float or2tr = f_pearson(aOR, aTR)          // preceding overnight -> intraday
+    float tr2or = f_pearson(aTRprev, aORcur)   // intraday -> following overnight
+
+    table.cell(panel, 0, 8,  "Buy & hold (" + unitTag + ")", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT, text_halign = text.align_left)
+    table.cell(panel, 1, 8,  na(bh) ? "—" : str.tostring(bh, "#.##"), text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT)
+    table.cell(panel, 2, 8,  str.tostring(nDays), text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT)
+    table.cell(panel, 3, 8,  "", bgcolor = rowBg)
+    table.cell(panel, 4, 8,  "", bgcolor = rowBg)
+
+    table.cell(panel, 0, 9,  "Cumulative overnight OR (" + unitTag + ")", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT, text_halign = text.align_left)
+    table.cell(panel, 1, 9,  str.tostring(pctMode ? (math.exp(cumORlog) - 1.0) * 100.0 : cumORpts, "#.##"), text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT)
+    table.cell(panel, 2, 9,  "", bgcolor = rowBg)
+    table.cell(panel, 3, 9,  "", bgcolor = rowBg)
+    table.cell(panel, 4, 9,  "", bgcolor = rowBg)
+
+    table.cell(panel, 0, 10, "Cumulative intraday TR (" + unitTag + ")", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT, text_halign = text.align_left)
+    table.cell(panel, 1, 10, str.tostring(pctMode ? (math.exp(cumTRlog) - 1.0) * 100.0 : cumTRpts, "#.##"), text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT)
+    table.cell(panel, 2, 10, "", bgcolor = rowBg)
+    table.cell(panel, 3, 10, "", bgcolor = rowBg)
+    table.cell(panel, 4, 10, "", bgcolor = rowBg)
+
+    table.cell(panel, 0, 11, "OR2TR  corr(OR_t , TR_t)", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT, text_halign = text.align_left)
+    table.cell(panel, 1, 11, na(or2tr) ? "—" : str.tostring(or2tr, "#.####"), text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT)
+    table.cell(panel, 2, 11, str.tostring(array.size(aOR)) + "d", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT)
+    table.cell(panel, 3, 11, "", bgcolor = rowBg)
+    table.cell(panel, 4, 11, "", bgcolor = rowBg)
+
+    table.cell(panel, 0, 12, "TR2OR  corr(TR_t , OR_t+1)", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT, text_halign = text.align_left)
+    table.cell(panel, 1, 12, na(tr2or) ? "—" : str.tostring(tr2or, "#.####"), text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT)
+    table.cell(panel, 2, 12, str.tostring(array.size(aTRprev)) + "d", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT)
+    table.cell(panel, 3, 12, "", bgcolor = rowBg)
+    table.cell(panel, 4, 12, "", bgcolor = rowBg)
+
+    string todayTxt = na(lastOR) ? "—" : "OR " + str.tostring(lastOR * 100.0, "#.##") + "%   TR " + str.tostring(nz(lastTR) * 100.0, "#.##") + "%"
+    table.cell(panel, 0, 13, "Last completed day", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT, text_halign = text.align_left)
+    table.cell(panel, 1, 13, todayTxt, text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeT)
+    table.cell(panel, 2, 13, lastPass ? "in slice" : "skipped", text_color = lastPass ? color.new(#26a69a, 0) : color.new(#ef5350, 0), bgcolor = rowBg, text_size = sizeT)
+    table.cell(panel, 3, 13, "", bgcolor = rowBg)
+    table.cell(panel, 4, 13, "", bgcolor = rowBg)
+
+// ------------------------------------------------------------------ alerts --
+alertcondition(process and lastPass, "Square it Off! — slice day qualifies", "Overnight-trend filter passed: short the open, square it off at the close.")

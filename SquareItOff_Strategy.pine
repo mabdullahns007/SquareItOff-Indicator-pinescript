@@ -1,0 +1,237 @@
+//@version=6
+// =============================================================================
+//  SQUARE IT OFF! — Intraday Short-and-Buy Strategy
+//
+//  Implements the trading rule of:
+//      Preet Deep Singh (2015), "Square it Off!: An intraday short-and-buy
+//      strategy", IIM Ahmedabad / SSRN abstract 3920557.
+//
+//  THE RULE
+//      Sell (short) the index at the opening of the regular session.
+//      Buy it back — "square it off" — at the close of the same session.
+//      No position is ever carried overnight, so no capital is blocked and
+//      there is no inventory carrying cost (the paper's stated edge over
+//      Jacobsen's buy-at-close / sell-at-open rule).
+//
+//  WHY IT IS SUPPOSED TO WORK
+//      The paper decomposes the daily move into
+//          OR_t = ln(open_t / close_{t-1})   the overnight (non-trading) return
+//          TR_t = ln(close_t / open_t)       the trading-time return
+//      and shows that for most indices in 1995-2014 the index gained almost
+//      entirely overnight while the regular session drifted down. The sum of
+//      those intraday falls, SIF = SUM(open_t - close_t), beat buy-and-hold by
+//      ~80% on the BSE Sensex and CAC 40.
+//
+//  TREND SLICES (paper, Table 2)
+//      Results are also reported conditional on the sign of the overnight gap
+//      today and the day before. The paper's own recommendation: the edge is
+//      strongest when the overnight trend has NOT been positive two days in a
+//      row, i.e. "SIF without 2 overnight increases". That slice is selectable
+//      below, along with the other five the paper reports.
+//
+//  EXECUTION MODEL — PLEASE READ
+//      * Use an INTRADAY chart. 1-minute is closest to the paper; 5-minute is
+//        a reasonable compromise on long histories.
+//      * process_orders_on_close = true, so the square-off fills exactly at
+//        the close of the square-off bar — the precise behaviour the paper
+//        requires ("we shall have to square off the position at the end of the
+//        day no matter what the case").
+//      * The consequence is that the entry fills at the CLOSE of the first
+//        session bar rather than the opening print. On a 1-minute chart that
+//        is a one-minute lag; on coarse timeframes it is material. This is a
+//        TradingView broker-emulator limitation, not a modelling choice.
+//
+//  COSTS
+//      Default commission is 0.015% per side — the discount-broker intraday
+//      rate the paper quotes. The paper's own headline numbers are gross.
+// =============================================================================
+
+//@strategy_alert_message {"strategy":"Square it Off!","ticker":"{{ticker}}","action":"{{strategy.order.action}}","comment":"{{strategy.order.comment}}","qty":"{{strategy.order.contracts}}","price":"{{close}}","position":"{{strategy.market_position}}","time":"{{timenow}}"}
+strategy(
+     title                  = "Square it Off! — Intraday Short-and-Buy (Singh 2015)",
+     shorttitle             = "Square it Off!",
+     overlay                = true,
+     process_orders_on_close = true,
+     calc_on_every_tick     = false,
+     pyramiding             = 0,
+     initial_capital        = 100000,
+     default_qty_type       = strategy.percent_of_equity,
+     default_qty_value      = 100,
+     commission_type        = strategy.commission.percent,
+     commission_value       = 0.015,
+     slippage               = 0,
+     margin_long            = 100,
+     margin_short           = 100)
+
+// ------------------------------------------------------------------ inputs --
+string GT = "① Trade"
+dirMode  = input.string("Short the open, cover the close (paper)", "Direction", options = ["Short the open, cover the close (paper)", "Long the open, sell the close (inverse test)"], group = GT, tooltip = "The paper's SIF is negative for NASDAQ and the S&P 500 over its sample, meaning the intraday session rose. Use the inverse leg to test those markets.")
+tzInput  = input.string("", "Timezone override (blank = exchange)", group = GT, tooltip = "e.g. America/New_York, Asia/Kolkata. Only affects the fixed-clock entry/exit options.")
+
+string GE = "② Entry"
+entryMode = input.string("First bar of the regular session", "Enter on", options = ["First bar of the regular session", "Fixed clock time"], group = GE)
+entryHH   = input.int(9,  "Entry hour",   minval = 0, maxval = 23, group = GE)
+entryMM   = input.int(30, "Entry minute", minval = 0, maxval = 59, group = GE)
+
+string GX = "③ Square-off"
+exitMode = input.string("Last bar of the regular session", "Exit on", options = ["Last bar of the regular session", "Fixed clock time"], group = GX)
+exitHH   = input.int(15, "Square-off hour",   minval = 0, maxval = 23, group = GX)
+exitMM   = input.int(55, "Square-off minute", minval = 0, maxval = 59, group = GX)
+forceFlat = input.bool(true, "Always force flat at the session close", group = GX, tooltip = "Safety net. The paper insists the position is squared off at the end of the day whatever the P&L.")
+
+string GS = "④ Overnight-trend filter (paper, Table 2)"
+sliceMode = input.string("All days", "Trade only on", group = GS, options = ["All days", "Days with an overnight increase", "Days with an overnight decrease", "Days with 2 overnight increases", "Days without 2 overnight increases", "Days with 2 overnight decreases", "Days without 2 overnight decreases"], tooltip = "'Without 2 overnight increases' is the paper's recommended slice: an increase-decrease, decrease-increase or decrease-decrease overnight pattern.")
+minOrPct  = input.float(0.0, "Minimum |overnight gap| (%)", minval = 0.0, step = 0.05, group = GS, tooltip = "The strategy only makes sense where there is genuine overnight trading. The paper drops years where the open barely differs from the previous close.")
+maxOrPct  = input.float(0.0, "Maximum |overnight gap| (%, 0 = no cap)", minval = 0.0, step = 0.25, group = GS, tooltip = "Optional. Skips shock gaps (earnings, macro) that the paper's index-level study does not distinguish.")
+
+string GW = "⑤ Calendar filter (Rogalski 1984)"
+succMode = input.string("All days", "Trading days", options = ["All days", "Successive days only", "Non-successive days only"], group = GW, tooltip = "Rogalski's split: a successive day is one whose previous trading day is the previous calendar day. Non-successive days follow a weekend or holiday.")
+useMon = input.bool(true, "Mon", inline = "dow", group = GW)
+useTue = input.bool(true, "Tue", inline = "dow", group = GW)
+useWed = input.bool(true, "Wed", inline = "dow", group = GW)
+useThu = input.bool(true, "Thu", inline = "dow", group = GW)
+useFri = input.bool(true, "Fri", inline = "dow", group = GW)
+
+string GR = "⑥ Risk"
+useSL = input.bool(false, "Stop loss", inline = "sl", group = GR)
+slPct = input.float(1.0, "%", minval = 0.05, step = 0.05, inline = "sl", group = GR)
+useTP = input.bool(false, "Take profit", inline = "tp", group = GR)
+tpPct = input.float(1.0, "%", minval = 0.05, step = 0.05, inline = "tp", group = GR)
+
+string GD = "⑦ Date range"
+useRange  = input.bool(false, "Limit backtest window", group = GD)
+startDate = input.time(timestamp("01 Jan 1995 00:00 +0000"), "From", group = GD)
+endDate   = input.time(timestamp("01 Jan 2100 00:00 +0000"), "To",   group = GD)
+
+string GV = "⑧ Display"
+showTable   = input.bool(true, "Show status panel", group = GV)
+showMarkers = input.bool(true, "Mark entry / square-off bars", group = GV)
+showBands   = input.bool(true, "Shade the day's open-to-close range", group = GV)
+
+// ---------------------------------------------------------------- context ---
+string tzUse = tzInput == "" ? syminfo.timezone : tzInput
+bool  isIntra = timeframe.isintraday
+bool  newDay  = ta.change(time("D")) != 0
+
+// Daily open / previous daily close, tracked from chart bars so nothing repaints.
+var float dayOpen      = na
+var float prevDayClose = na
+var float lastClose    = na
+var float orToday      = na
+var float orYest       = na
+var int   dayStartTime = na
+var int   prevDayTime  = na
+
+if newDay
+    prevDayClose := lastClose
+    dayOpen      := open
+    orYest       := orToday
+    orToday      := na(prevDayClose) or prevDayClose <= 0 ? na : math.log(dayOpen / prevDayClose)
+    prevDayTime  := dayStartTime
+    dayStartTime := time
+lastClose := close
+
+float orPct = na(orToday) ? na : (dayOpen / prevDayClose - 1.0) * 100.0
+float absOr = na(orPct) ? na : math.abs(orPct)
+
+// ----------------------------------------------------------------- filters --
+bool gapOk = not na(absOr) and absOr >= minOrPct and (maxOrPct <= 0 or absOr <= maxOrPct)
+bool up    = nz(orToday, 0.0) > 0
+bool dn    = nz(orToday, 0.0) < 0
+bool up1   = nz(orYest,  0.0) > 0
+bool dn1   = nz(orYest,  0.0) < 0
+
+bool sliceOk = switch sliceMode
+    "All days"                           => true
+    "Days with an overnight increase"    => up
+    "Days with an overnight decrease"    => dn
+    "Days with 2 overnight increases"    => up and up1
+    "Days without 2 overnight increases" => not (up and up1)
+    "Days with 2 overnight decreases"    => dn and dn1
+    "Days without 2 overnight decreases" => not (dn and dn1)
+    => true
+
+float calDaysGap = na(prevDayTime) ? na : (dayStartTime - prevDayTime) / 86400000.0
+bool  successive = not na(calDaysGap) and calDaysGap <= 1.5
+bool  calOk = switch succMode
+    "Successive days only"     => successive
+    "Non-successive days only" => not na(calDaysGap) and not successive
+    => true
+
+int dw = dayofweek(nz(dayStartTime, time), tzUse)
+bool dowOk = (dw == dayofweek.monday and useMon) or (dw == dayofweek.tuesday and useTue) or (dw == dayofweek.wednesday and useWed) or (dw == dayofweek.thursday and useThu) or (dw == dayofweek.friday and useFri) or (dw == dayofweek.saturday or dw == dayofweek.sunday)
+
+bool inRange = not useRange or (time >= startDate and time <= endDate)
+bool tradeOk = isIntra and gapOk and sliceOk and calOk and dowOk and inRange
+
+// ---------------------------------------------------------------- triggers --
+// One-shot clock trigger. Each call site keeps its own latch, reset every day.
+f_clockTrigger(int hh, int mm, string tz, bool dayReset) =>
+    var bool fired = false
+    if dayReset
+        fired := false
+    int mow = hour(time_close, tz) * 60 + minute(time_close, tz)
+    bool trig = not fired and mow >= hh * 60 + mm
+    if trig
+        fired := true
+    trig
+
+bool entryTrigger = isIntra and (entryMode == "Fixed clock time" ? f_clockTrigger(entryHH, entryMM, tzUse, newDay) : session.isfirstbar_regular)
+bool exitTrigger  = isIntra and (exitMode  == "Fixed clock time" ? f_clockTrigger(exitHH,  exitMM,  tzUse, newDay) : session.islastbar_regular)
+
+bool goLong = dirMode == "Long the open, sell the close (inverse test)"
+
+// ------------------------------------------------------------------ orders --
+if tradeOk and entryTrigger and strategy.position_size == 0 and not exitTrigger
+    strategy.entry("SqOff", goLong ? strategy.long : strategy.short, comment = goLong ? "Buy the open" : "Short the open")
+
+if strategy.position_size != 0 and (useSL or useTP)
+    float px = strategy.position_avg_price
+    bool  isShort = strategy.position_size < 0
+    float slPx = useSL ? (isShort ? px * (1.0 + slPct / 100.0) : px * (1.0 - slPct / 100.0)) : na
+    float tpPx = useTP ? (isShort ? px * (1.0 - tpPct / 100.0) : px * (1.0 + tpPct / 100.0)) : na
+    strategy.exit("Stop/Target", from_entry = "SqOff", stop = slPx, limit = tpPx)
+
+if strategy.position_size != 0 and (exitTrigger or (forceFlat and session.islastbar_regular))
+    strategy.close_all(comment = "Square it off")
+
+// ----------------------------------------------------------------- visuals --
+bool inTrade = strategy.position_size != 0
+bgcolor(showBands and inTrade ? color.new(goLong ? #26a69a : #ef5350, 93) : na, title = "Position held")
+
+plotshape(showMarkers and entryTrigger and tradeOk, "Entry", shape.triangledown, location.abovebar, color.new(#ef5350, 0), size = size.tiny)
+plotshape(showMarkers and exitTrigger and inTrade,  "Square off", shape.triangleup, location.belowbar, color.new(#26a69a, 0), size = size.tiny)
+
+plot(isIntra ? dayOpen : na, "Day open", color = color.new(#2962ff, 40), style = plot.style_stepline, linewidth = 1)
+plot(isIntra ? prevDayClose : na, "Previous close", color = color.new(#787b86, 40), style = plot.style_stepline, linewidth = 1)
+
+// ------------------------------------------------------------------- panel --
+var table panel = table.new(position.top_right, 2, 9, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 50), border_color = color.new(color.gray, 70))
+
+f_row(int r, string k, string v, color vc) =>
+    table.cell(panel, 0, r, k, text_color = chart.fg_color, bgcolor = color.new(color.gray, 92), text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, r, v, text_color = vc, bgcolor = color.new(color.gray, 92), text_size = size.small, text_halign = text.align_right)
+
+if showTable and barstate.islast
+    table.cell(panel, 0, 0, "Square it Off!", text_color = color.white, bgcolor = color.new(#2962ff, 15), text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 0, goLong ? "long the open" : "short the open", text_color = color.white, bgcolor = color.new(#2962ff, 15), text_size = size.small, text_halign = text.align_right)
+
+    f_row(1, "Overnight gap  OR", na(orPct) ? "—" : str.tostring(orPct, "#.###") + "%", na(orPct) ? chart.fg_color : orPct > 0 ? color.new(#26a69a, 0) : color.new(#ef5350, 0))
+    f_row(2, "Previous day OR", na(orYest) ? "—" : str.tostring((math.exp(orYest) - 1.0) * 100.0, "#.###") + "%", na(orYest) ? chart.fg_color : orYest > 0 ? color.new(#26a69a, 0) : color.new(#ef5350, 0))
+    f_row(3, "Day open / prev close", na(dayOpen) ? "—" : str.tostring(dayOpen, format.mintick) + " / " + str.tostring(prevDayClose, format.mintick), chart.fg_color)
+    f_row(4, "Trend slice", sliceOk ? "pass" : "skip", sliceOk ? color.new(#26a69a, 0) : color.new(#ef5350, 0))
+    f_row(5, "Calendar / gap filter", calOk and gapOk and dowOk ? "pass" : "skip", calOk and gapOk and dowOk ? color.new(#26a69a, 0) : color.new(#ef5350, 0))
+    f_row(6, "Position", inTrade ? (strategy.position_size < 0 ? "short " + str.tostring(math.abs(strategy.position_size), "#.##") : "long " + str.tostring(strategy.position_size, "#.##")) : "flat", inTrade ? color.new(#ff9800, 0) : chart.fg_color)
+    f_row(7, "Closed trades", str.tostring(strategy.closedtrades), chart.fg_color)
+    f_row(8, "Net profit", str.tostring(strategy.netprofit, "#.##"), strategy.netprofit >= 0 ? color.new(#26a69a, 0) : color.new(#ef5350, 0))
+
+// Timeframe guard — the broker emulator cannot model an open-to-close intraday
+// trade on a daily bar, so refuse to trade rather than report fictitious fills.
+if barstate.islast and not isIntra
+    var label warn = na
+    label.delete(warn)
+    warn := label.new(bar_index, high, "Square it Off! needs an INTRADAY timeframe\n(1m–15m). On daily bars the open-to-close\ntrade cannot be simulated — use the companion\nindicator for daily-bar SIF analytics.", style = label.style_label_left, color = color.new(#ef5350, 10), textcolor = color.white, size = size.normal)
+
+// ------------------------------------------------------------------ alerts --
+alertcondition(entryTrigger and tradeOk, "Square it Off! — entry", "Session open: take the intraday position.")
+alertcondition(exitTrigger, "Square it Off! — square off", "Session close: square off the intraday position.")
